@@ -163,7 +163,6 @@ jobs:
             --build-dir build \
             --build-system makefile \
             --output-dir outputs \
-            --output gbl \
             --output hex \
             --output out
 
