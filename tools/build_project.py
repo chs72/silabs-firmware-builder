@@ -42,6 +42,40 @@ LOGGER = logging.getLogger(__name__)
 
 yaml = YAML(typ="safe")
 
+# prefix components:
+TREE_SPACE = "    "
+TREE_BRANCH = "│   "
+# pointers:
+TREE_TEE = "├── "
+TREE_LAST = "└── "
+
+
+def tree(dir_path: pathlib.Path, prefix: str = ""):
+    """A recursive generator, given a directory Path object
+    will yield a visual tree structure line by line
+    with each line prefixed by the same characters
+    Source: https://stackoverflow.com/a/59109706
+    """
+    contents = list(dir_path.iterdir())
+    # contents each get pointers that are ├── with a final └── :
+    pointers = [TREE_TEE] * (len(contents) - 1) + [TREE_LAST]
+
+    for pointer, path in zip(pointers, contents):
+        yield prefix + pointer + path.name
+
+        if path.is_dir():  # extend the prefix and recurse:
+            extension = TREE_BRANCH if pointer == TREE_TEE else TREE_SPACE
+
+            # i.e. space because last, └── , above so no more |
+            yield from tree(path, prefix=prefix + extension)
+
+
+def log_tree(dir_path: pathlib.Path, prefix: str = ""):
+    LOGGER.info(f"Tree for {dir_path}:")
+
+    for line in tree(dir_path, prefix):
+        LOGGER.info(line)
+
 
 def evaulate_f_string(f_string: str, variables: dict[str, typing.Any]) -> str:
     """
@@ -486,6 +520,8 @@ def main():
         ],
         check=True,
     )
+
+    log_tree(args.build_dir)
 
     # Actually search for C defines within config
     unused_defines = set(manifest.get("c_defines", {}).keys())
