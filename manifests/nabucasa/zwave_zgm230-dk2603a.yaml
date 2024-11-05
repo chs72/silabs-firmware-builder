@@ -1,0 +1,25 @@
+name: ZGM230-DK2603A
+device: ZGM230SB27HGN
+base_project: src/zwave_ncp_serial_api_controller
+
+gbl:
+  fw_type: z-wave
+  dynamic: ["zwave_version"]
+  baudrate: 115200
+  compression: lz4
+  sign_key: "{SDK_DIR}/protocol/z-wave/platform/SiliconLabs/PAL/BootLoader/controller-keys/controller_sign.key"
+  encrypt_key: "{SDK_DIR}/protocol/z-wave/platform/SiliconLabs/PAL/BootLoader/controller-keys/controller_encrypt.key"
+
+c_defines:
+  ZAF_CONFIG_MANUFACTURER_ID: "0x0466"
+  ZAF_CONFIG_PRODUCT_TYPE_ID: "0x0001"
+  ZAF_CONFIG_PRODUCT_ID: "0x0001"
+
+  SERIAL_API_PERIPHERAL: USART0
+  SERIAL_API_PERIPHERAL_NO: 0
+
+  SERIAL_API_TX_PORT: gpioPortA
+  SERIAL_API_TX_PIN:  8
+
+  SERIAL_API_RX_PORT: gpioPortA
+  SERIAL_API_RX_PIN:  9

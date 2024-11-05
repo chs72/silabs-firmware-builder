@@ -6,6 +6,7 @@ from __future__ import annotations
 import re
 import ast
 import sys
+import copy
 import json
 import time
 import shutil
@@ -17,10 +18,22 @@ import argparse
 import contextlib
 import subprocess
 import multiprocessing
-from datetime import datetime, timezone
 
+from xml.etree import ElementTree
 from ruamel.yaml import YAML
 
+# Matches all known chip and board names. Some varied examples:
+#   MGM210PB32JIA EFM32GG890F512 MGM12P22F1024GA EZR32WG330F128R69 EFR32FG14P231F256GM32
+CHIP_REGEX = re.compile(r"^(?:[a-z]+\d+){2,5}[a-z]*$", flags=re.IGNORECASE)
+BOARD_REGEX = re.compile(r"^brd\d+[a-z](?:_.+)?$", flags=re.IGNORECASE)
+GRAPH_COMPONENT_REGEX = re.compile(r"^(\w+)|- (\w+)", flags=re.MULTILINE)
+
+CHIP_SPECIFIC_COMPONENTS = {
+    "sl_system": "sl_system",
+    "sl_memory": "sl_memory",
+    # There are only a few components whose filename doesn't match the component name
+    "freertos": "freertos_kernel",
+}
 
 SLC = ["slc", "--daemon", "--daemon-timeout", "1"]
 
@@ -29,69 +42,13 @@ LOGGER = logging.getLogger(__name__)
 
 yaml = YAML(typ="safe")
 
-# prefix components:
-TREE_SPACE = "    "
-TREE_BRANCH = "│   "
-# pointers:
-TREE_TEE = "├── "
-TREE_LAST = "└── "
 
-DEFAULT_JSON_CONFIG = [
-    # Fix a few paths by default
-    {
-        "file": "config/zcl/zcl_config.zap",
-        "jq": '(.package[] | select(.type == "zcl-properties")).path = "template:{sdk}/app/zcl/zcl-zap.json"',
-        "skip_if_missing": True,
-    },
-    {
-        "file": "config/zcl/zcl_config.zap",
-        "jq": '(.package[] | select(.type == "gen-templates-json")).path = "template:{sdk}/protocol/zigbee/app/framework/gen-template/gen-templates.json"',
-        "skip_if_missing": True,
-    },
-]
-
-
-def tree(dir_path: pathlib.Path, prefix: str = ""):
-    """A recursive generator, given a directory Path object
-    will yield a visual tree structure line by line
-    with each line prefixed by the same characters
-    Source: https://stackoverflow.com/a/59109706
-    """
-    contents = list(dir_path.iterdir())
-    # contents each get pointers that are ├── with a final └── :
-    pointers = [TREE_TEE] * (len(contents) - 1) + [TREE_LAST]
-
-    for pointer, path in zip(pointers, contents):
-        yield prefix + pointer + path.name
-
-        if path.is_dir():  # extend the prefix and recurse:
-            extension = TREE_BRANCH if pointer == TREE_TEE else TREE_SPACE
-
-            # i.e. space because last, └── , above so no more |
-            yield from tree(path, prefix=prefix + extension)
-
-
-def log_tree(dir_path: pathlib.Path, prefix: str = ""):
-    LOGGER.info(f"Tree for {dir_path}:")
-
-    for line in tree(dir_path, prefix):
-        LOGGER.info(line)
-
-
-def evaluate_f_string(f_string: str, variables: dict[str, typing.Any]) -> str:
+def evaulate_f_string(f_string: str, variables: dict[str, typing.Any]) -> str:
     """
     Evaluates an `f`-string with the given locals.
     """
 
     return eval("f" + repr(f_string), variables)
-
-
-def expand_template(value: typing.Any, env: dict[str, typing.Any]) -> typing.Any:
-    """Expand a template string."""
-    if isinstance(value, str) and value.find("template:") != -1:
-        return evaluate_f_string(value.replace("template:", "", 1), env)
-    else:
-        return value
 
 
 def ensure_folder(path: str | pathlib.Path) -> pathlib.Path:
@@ -181,103 +138,48 @@ def get_git_commit_id(repo: pathlib.Path) -> str:
     return commit_id
 
 
-def load_sdks(paths: list[pathlib.Path]) -> dict[pathlib.Path, str]:
-    """Load the SDK metadata from the SDKs."""
-    sdks = {}
+def determine_chip_specific_config_filenames(
+    slcp_path: pathlib.Path, sdk: pathlib.Path
+) -> list[str]:
+    """Determine the chip-specific config files to remove."""
+    proc = subprocess.run(
+        SLC
+        + [
+            "graph",
+            "--project-file",
+            str(slcp_path.absolute()),
+            "--sdk",
+            str(sdk.absolute()),
+        ],
+        cwd=str(slcp_path.parent),
+        check=True,
+        text=True,
+        capture_output=True,
+    )
 
-    for sdk in paths:
-        sdk_file = next(sdk.glob("*_sdk.slcs"))
+    all_components = {a or b for a, b in GRAPH_COMPONENT_REGEX.findall(proc.stdout)}
 
-        try:
-            sdk_meta = yaml.load(sdk_file.read_text())
-        except FileNotFoundError:
-            LOGGER.warning("SDK %s is not valid, skipping", sdk)
+    # Some configs don't seem to be present explicitly in the component graph
+    config_files = {"sl_memory_config.h"}
+
+    # List all of the SLCC files. There are neary 4,000.
+    slcc_paths = {slcc.stem.lower(): slcc for slcc in sdk.glob("**/*.slcc")}
+
+    for component_id in all_components:
+        if CHIP_REGEX.match(component_id) or BOARD_REGEX.match(component_id):
+            pass
+        elif component_id in CHIP_SPECIFIC_COMPONENTS:
+            component_id = CHIP_SPECIFIC_COMPONENTS[component_id]
+        else:
             continue
 
-        sdk_id = sdk_meta["id"]
-        sdk_version = sdk_meta["sdk_version"]
-        sdks[sdk] = f"{sdk_id}:{sdk_version}"
+        slcc = yaml.load(slcc_paths[component_id.lower()].read_text())
 
-    return sdks
+        for config_file in slcc.get("config_file", []):
+            path = pathlib.PurePosixPath(config_file["path"]).name
+            config_files.add(path)
 
-
-def load_toolchains(paths: list[pathlib.Path]) -> dict[pathlib.Path, str]:
-    """Load the toolchain metadata from the toolchains."""
-    toolchains = {}
-
-    for toolchain in paths:
-        gcc_plugin_version_h = next(
-            toolchain.glob("lib/gcc/arm-none-eabi/*/plugin/include/plugin-version.h")
-        )
-        version_info = {}
-
-        for line in gcc_plugin_version_h.read_text().split("\n"):
-            # static char basever[] = "10.3.1";
-            if line.startswith("static char") and line.endswith(";"):
-                name = line.split("[]", 1)[0].split()[-1]
-                value = ast.literal_eval(line.split(" = ", 1)[1][:-1])
-                version_info[name] = value
-
-        toolchains[toolchain] = (
-            version_info["basever"] + "." + version_info["datestamp"]
-        )
-
-    return toolchains
-
-
-def zap_select_endpoint_type(endpoint_type_name: int | str) -> str:
-    return (
-        ".endpointTypes[]"
-        if endpoint_type_name == "all"
-        else f'.endpointTypes[] | select(.name == "{endpoint_type_name}")'
-    )
-
-
-def zap_select_cluster(cluster_name: int | str) -> str:
-    return (
-        ".clusters[]"
-        if cluster_name == "all"
-        else f'.clusters[] | select(.name == "{cluster_name}")'
-    )
-
-
-def zap_delete_cluster(
-    cluster_name: str, endpoint_type_name: int | str = "all"
-) -> list[dict[str, typing.Any]]:
-    return [
-        {
-            "file": "config/zcl/zcl_config.zap",
-            "jq": f'del({zap_select_endpoint_type(endpoint_type_name)}.clusters[] | select(.name == "{cluster_name}"))',
-            "skip_if_missing": False,
-        }
-    ]
-
-
-def zap_set_cluster_attribute(
-    attribute_name: str,
-    default_value: typing.Any,
-    endpoint_type_name: int | str = "all",
-    cluster_name: int | str = "all",
-) -> list[dict[str, typing.Any]]:
-    return [
-        {
-            "file": "config/zcl/zcl_config.zap",
-            "jq": f'({zap_select_endpoint_type(endpoint_type_name)}{zap_select_cluster(cluster_name)}.attributes[] | select(.name == "{attribute_name}")).defaultValue = "{default_value}"',
-            "skip_if_missing": False,
-        }
-    ]
-
-
-def subprocess_run_verbose(command: list[str], prefix: str) -> None:
-    with subprocess.Popen(
-        command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-    ) as proc:
-        for line in proc.stdout:
-            LOGGER.info("[%s] %r", prefix, line.decode("utf-8").strip())
-
-    if proc.returncode != 0:
-        LOGGER.error("[%s] Error: %s", prefix, proc.returncode)
-        sys.exit(1)
+    return config_files
 
 
 def main():
@@ -374,6 +276,8 @@ def main():
     if args.build_dir is None:
         args.build_dir = pathlib.Path(f"build/{time.time():.0f}_{args.manifest.stem}")
 
+    LOGGER.info("Building in %s", args.build_dir.resolve())
+
     # argparse defaults should be replaced, not extended
     if args.sdks != get_sdk_default_paths():
         args.sdks = args.sdks[len(get_sdk_default_paths()) :]
@@ -383,68 +287,35 @@ def main():
 
     manifest = yaml.load(args.manifest.read_text())
 
-    # Ensure we can load the correct SDK and toolchain
-    sdks = load_sdks(args.sdks)
-    sdk, sdk_name_version = next(
-        (path, version) for path, version in sdks.items() if version == manifest["sdk"]
-    )
-    sdk_name, _, sdk_version = sdk_name_version.partition(":")
-
-    toolchains = load_toolchains(args.toolchains)
-    toolchain = next(
-        path for path, version in toolchains.items() if version == manifest["toolchain"]
-    )
-
     for key, override in args.overrides:
         manifest[key] = override
 
-    # First, copy the base project into the build dir, under `template/`
+    # First, load the base project
     projects_root = pathlib.Path(__file__).parent.parent
     base_project_path = projects_root / manifest["base_project"]
     assert base_project_path.is_relative_to(projects_root)
-
-    build_template_path = args.build_dir / "template"
-
-    LOGGER.info("Building in %s", args.build_dir.resolve())
-
-    if args.clean_build_dir:
-        with contextlib.suppress(OSError):
-            shutil.rmtree(args.build_dir)
-
-    shutil.copytree(
-        base_project_path,
-        build_template_path,
-        dirs_exist_ok=True,
-        ignore=lambda dir, contents: [
-            "autogen",
-            ".git",
-            ".settings",
-            ".projectlinkstore",
-            ".project",
-            ".pdm",
-            ".cproject",
-            ".uceditor",
-        ],
-    )
-
-    log_tree(build_template_path)
-
-    # We extend the base project with the manifest, since added components could have
-    # extra dependencies
-    (base_project_slcp,) = build_template_path.glob("*.slcp")
-    base_project_name = base_project_slcp.stem
+    (base_project_slcp,) = base_project_path.glob("*.slcp")
     base_project = yaml.load(base_project_slcp.read_text())
+    base_project_name = base_project_path.stem
+
+    output_project = copy.deepcopy(base_project)
+
+    # Strip chip- and board-specific components to modify the base device type
+    output_project["component"] = [
+        c
+        for c in output_project["component"]
+        if not CHIP_REGEX.match(c["id"]) and not BOARD_REGEX.match(c["id"])
+    ]
+    output_project["component"].append({"id": manifest["device"]})
 
     # Add new components
-    base_project["component"].extend(manifest.get("add_components", []))
-    base_project.setdefault("toolchain_settings", []).extend(
-        manifest.get("toolchain_settings", [])
-    )
+    output_project["component"].extend(manifest.get("add_components", []))
+    output_project["toolchain_settings"].extend(manifest.get("toolchain_settings", []))
 
     # Remove components
     for component in manifest.get("remove_components", []):
         try:
-            base_project["component"].remove(component)
+            output_project["component"].remove(component)
         except ValueError:
             LOGGER.warning(
                 "Component %s is not present in manifest, cannot remove", component
@@ -455,11 +326,11 @@ def main():
     for input_config, output_config in [
         (
             manifest.get("configuration", {}),
-            base_project.setdefault("configuration", []),
+            output_project.setdefault("configuration", []),
         ),
         (
             manifest.get("slcp_defines", {}),
-            base_project.setdefault("define", []),
+            output_project.setdefault("define", []),
         ),
     ]:
         for name, value in input_config.items():
@@ -475,100 +346,120 @@ def main():
                 # Otherwise, append it
                 output_config.append({"name": name, "value": value})
 
-    # Finally, write out the modified base project
-    with base_project_slcp.open("w") as f:
-        yaml.dump(base_project, f)
+    # Template variables for C defines
+    value_template_env = {
+        "git_repo_hash": get_git_commit_id(repo=pathlib.Path(__file__).parent.parent),
+        "manifest_name": args.manifest.stem,
+    }
+
+    # Copy the base project into the output directory
+    if args.clean_build_dir:
+        with contextlib.suppress(OSError):
+            shutil.rmtree(args.build_dir)
+
+    args.build_dir.mkdir(exist_ok=True, parents=True)
+
+    shutil.copytree(
+        base_project_path,
+        args.build_dir,
+        dirs_exist_ok=True,
+        ignore=lambda dir, contents: [
+            # XXX: pruning `autogen` is extremely important!
+            "autogen",
+            ".git",
+            ".settings",
+            ".projectlinkstore",
+            ".project",
+            ".pdm",
+            ".cproject",
+            ".uceditor",
+        ],
+    )
+
+    # Delete the original project file
+    (args.build_dir / base_project_slcp.name).unlink()
+
+    # Write the new project SLCP file
+    with (args.build_dir / f"{base_project_name}.slcp").open("w") as f:
+        yaml.dump(output_project, f)
 
     # Create a GBL metadata file
     with (args.build_dir / "gbl_metadata.yaml").open("w") as f:
         yaml.dump(manifest["gbl"], f)
 
-    # Template variables
-    value_template_env = {
-        "git_repo_hash": get_git_commit_id(repo=pathlib.Path(__file__).parent.parent),
-        "manifest_name": args.manifest.stem,
-        "now": datetime.now(timezone.utc),
-        "sdk": sdk,
-        "sdk_version": sdk_version,
-    }
+    # Generate a build directory
+    cmake_build_root = args.build_dir / f"{base_project_name}_cmake"
+    shutil.rmtree(cmake_build_root, ignore_errors=True)
 
-    LOGGER.info("Using templating env:")
-    LOGGER.info(str(value_template_env))
+    sdk_name: str
 
-    zap_config = manifest.get("zap_config", None)
-    zap_json_config: list[dict[str, typing.Any]] = []
+    # Find the SDK version required by the project
+    for sdk in args.sdks:
+        sdk_name = "gecko_sdk" if "gecko_sdk" in sdk.name else "simplicity_sdk"
 
-    if zap_config:
-        for endpoint_type in zap_config.get("endpoint_types", []):
-            for cluster in endpoint_type.get("clusters", []):
-                for to_remove in cluster.get("remove", []):
-                    zap_json_config += zap_delete_cluster(
-                        to_remove, endpoint_type["name"]
-                    )
-
-                for attribute_name, default_value in cluster.get(
-                    "attribute_defaults", {}
-                ).items():
-                    zap_json_config += zap_set_cluster_attribute(
-                        attribute_name,
-                        expand_template(default_value, value_template_env),
-                        endpoint_type["name"],
-                        cluster["name"],
-                    )
-
-    # JSON config
-    for json_config in (
-        DEFAULT_JSON_CONFIG + manifest.get("json_config", []) + zap_json_config
-    ):
-        json_path = build_template_path / json_config["file"]
-
-        if json_config.get("skip_if_missing", False) and not json_path.exists():
+        try:
+            sdk_meta = yaml.load((sdk / f"{sdk_name}.slcs").read_text())
+        except FileNotFoundError:
+            LOGGER.warning("SDK %s is not valid, skipping", sdk)
             continue
 
-        jq_arg = expand_template(json_config["jq"], value_template_env)
+        LOGGER.info("SDK %s has version %s", sdk, sdk_meta["sdk_version"])
 
-        LOGGER.info(f"Patching {json_path} with {jq_arg}")
+        if base_project["sdk"]["id"] != sdk_name:
+            continue
 
-        result = subprocess.run(
-            [
-                "jq",
-                jq_arg,
-                json_path,
-            ],
-            capture_output=True,
-        )
+        if base_project["sdk"]["version"] == sdk_meta["sdk_version"]:
+            LOGGER.info("Version is correct, picking %s", sdk)
+            break
+    else:
+        LOGGER.error("Project SDK version %s not found", base_project["sdk"]["version"])
+        sys.exit(1)
 
-        if result.returncode != 0:
-            LOGGER.error("jq stderr: %s\n%s", result.returncode, result.stderr)
-            sys.exit(1)
+    LOGGER.info("Building component graph and identifying board-specific files")
+    for name in determine_chip_specific_config_filenames(
+        slcp_path=base_project_slcp, sdk=sdk
+    ):
+        try:
+            (args.build_dir / f"config/{name}").unlink()
+        except FileNotFoundError:
+            pass
+        else:
+            LOGGER.info("Deleted device-specific config: %s", name)
 
-        with open(json_path, "wb") as f:
-            f.write(result.stdout)
-
-    log_tree(build_template_path)
-
-    # Next, generate a chip-specific project from the modified base project
-    LOGGER.info(f"Generating project for {manifest['device']}")
-
-    # fmt: off
-    subprocess_run_verbose(
-        SLC
-        + [
-            "generate",
-            "--with", manifest["device"],
-            "--project-file", base_project_slcp.resolve(),
-            "--export-destination", args.build_dir.resolve(),
-            "--copy-proj-sources",
-            "--new-project",
-            "--toolchain", "toolchain_gcc",
-            "--sdk", sdk,
-            "--output-type", args.build_system,
-        ],
-        "slc generate"
+    # Find the toolchain required by the project
+    slps_path = (args.build_dir / base_project_name).with_suffix(".slps")
+    slps_xml = ElementTree.parse(slps_path)
+    slps_toolchain_id = (
+        slps_xml.getroot()
+        .find(".//properties[@key='projectCommon.toolchainId']")
+        .attrib["value"]
+        .split(":")[-1]
     )
-    # fmt: on
 
-    log_tree(args.build_dir)
+    # Find the correct toolchain
+    for toolchain in args.toolchains:
+        gcc_plugin_version_h = next(
+            toolchain.glob("lib/gcc/arm-none-eabi/*/plugin/include/plugin-version.h")
+        )
+        version_info = {}
+
+        for line in gcc_plugin_version_h.read_text().split("\n"):
+            # static char basever[] = "10.3.1";
+            if line.startswith("static char") and line.endswith(";"):
+                name = line.split("[]", 1)[0].split()[-1]
+                value = ast.literal_eval(line.split(" = ", 1)[1][:-1])
+                version_info[name] = value
+
+        toolchain_id = version_info["basever"] + "." + version_info["datestamp"]
+
+        LOGGER.info("Toolchain %s has version %s", toolchain, toolchain_id)
+
+        if toolchain_id == slps_toolchain_id:
+            LOGGER.info("Version is correct, picking %s", toolchain)
+            break
+    else:
+        LOGGER.error("Project toolchain version %s not found", slps_toolchain_id)
+        sys.exit(1)
 
     # Make sure all extensions are valid
     for sdk_extension in base_project.get("sdk_extension", []):
@@ -578,10 +469,26 @@ def main():
             LOGGER.error("Referenced extension not present in SDK: %s", expected_dir)
             sys.exit(1)
 
+    subprocess.run(
+        SLC
+        + [
+            "generate",
+            "--project-file",
+            (args.build_dir / f"{base_project_name}.slcp").resolve(),
+            "--export-destination",
+            args.build_dir.resolve(),
+            "--sdk",
+            sdk,
+            "--toolchain",
+            "toolchain_gcc",
+            "--output-type",
+            args.build_system,
+        ],
+        check=True,
+    )
+
     # Actually search for C defines within config
     unused_defines = set(manifest.get("c_defines", {}).keys())
-
-    LOGGER.info(manifest.get("c_defines", {}))
 
     for config_root in [args.build_dir / "autogen", args.build_dir / "config"]:
         for config_f in config_root.glob("*.h"):
@@ -590,7 +497,7 @@ def main():
             new_config_h_lines = []
 
             for index, line in enumerate(config_h_lines):
-                for define, value in manifest.get("c_defines", {}).items():
+                for define, value_template in manifest.get("c_defines", {}).items():
                     if f"#define {define} " not in line:
                         continue
 
@@ -608,14 +515,23 @@ def main():
 
                         # Make sure that we do not have conflicting defines provided over the command line
                         assert not any(
-                            c["name"] == define for c in base_project.get("define", [])
+                            c["name"] == define
+                            for c in output_project.get("define", [])
                         )
                         new_config_h_lines[index - 1] = "#if 1"
                     elif "#warning" in prev_line:
                         assert re.match(r'#warning ".*? not configured"', prev_line)
                         new_config_h_lines.pop(index - 1)
 
-                    value = expand_template(value, value_template_env)
+                    value_template = str(value_template)
+
+                    if value_template.startswith("template:"):
+                        value = value_template.replace("template:", "", 1).format(
+                            **value_template_env
+                        )
+                    else:
+                        value = value_template
+
                     new_config_h_lines.append(f"#define {define}{alignment}{value}")
                     written_config[define] = value
 
@@ -656,14 +572,7 @@ def main():
             args.build_dir: "/src",
             toolchain: "/toolchain",
         }.items()
-    ] + [
-        "-Wall",
-        "-Wextra",
-        "-Werror",
-        # XXX: Fails due to protocol/openthread/platform-abstraction/efr32/radio.c@RAILCb_Generic
-        # Remove once this is fixed in the SDK!
-        "-Wno-error=unused-but-set-variable",
-    ]
+    ] + ["-Wall", "-Wextra", "-Werror"]
 
     output_artifact = (args.build_dir / "build/debug" / base_project_name).with_suffix(
         ".gbl"
@@ -693,26 +602,26 @@ def main():
 
     makefile.write_text(makefile_contents)
 
-    # fmt: off
-    subprocess_run_verbose(
-        [   
+    subprocess.run(
+        [
             "make",
-            "-C", args.build_dir,
-            "-f", f"{base_project_name}.Makefile",
+            "-C",
+            args.build_dir,
+            "-f",
+            f"{base_project_name}.Makefile",
             f"-j{multiprocessing.cpu_count()}",
             f"ARM_GCC_DIR={toolchain}",
             f"POST_BUILD_EXE={args.postbuild}",
             "VERBOSE=1",
         ],
-        "make"
+        check=True,
     )
-    # fmt: on
 
     # Read the metadata extracted from the source and build trees
     extracted_gbl_metadata = json.loads(
         (output_artifact.parent / "gbl_metadata.json").read_text()
     )
-    base_filename = evaluate_f_string(
+    base_filename = evaulate_f_string(
         manifest.get("filename", "{manifest_name}"),
         {**value_template_env, **extracted_gbl_metadata},
     )
