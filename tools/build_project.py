@@ -600,6 +600,14 @@ def main():
             )
         )
 
+    args.output_dir.mkdir(exist_ok=True)
+
+    shutil.copytree(
+        args.build_dir,
+        args.output_dir,
+        dirs_exist_ok=True,
+    )
+
     # Remove absolute paths from the build for reproducibility
     extra_compiler_flags = [
         f"-ffile-prefix-map={str(src.absolute())}={dst}"
@@ -662,7 +670,7 @@ def main():
     #     {**value_template_env, **extracted_gbl_metadata},
     # )
 
-    args.output_dir.mkdir(exist_ok=True)
+    # args.output_dir.mkdir(exist_ok=True)
 
     # Copy the output artifacts
     for extension, output_path in args.outputs:
