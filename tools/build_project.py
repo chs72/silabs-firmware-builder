@@ -619,14 +619,14 @@ def main():
 
     # Inject a postbuild step into the makefile
     makefile_contents += "\n"
-    makefile_contents += "post-build:\n"
-    makefile_contents += (
-        f"\t-{args.postbuild}"
-        f' postbuild "{(args.build_dir / base_project_name).resolve()}.slpb"'
-        f' --parameter build_dir:"{output_artifact.parent.resolve()}"'
-        f' --parameter sdk_dir:"{sdk}"'
-        "\n"
-    )
+    # makefile_contents += "post-build:\n"
+    # makefile_contents += (
+    #     f"\t-{args.postbuild}"
+    #     f' postbuild "{(args.build_dir / base_project_name).resolve()}.slpb"'
+    #     f' --parameter build_dir:"{output_artifact.parent.resolve()}"'
+    #     f' --parameter sdk_dir:"{sdk}"'
+    #     "\n"
+    # )
     makefile_contents += "\t-@echo ' '"
 
     for flag in ("C_FLAGS", "CXX_FLAGS"):
@@ -647,27 +647,27 @@ def main():
             f"{base_project_name}.Makefile",
             f"-j{multiprocessing.cpu_count()}",
             f"ARM_GCC_DIR={toolchain}",
-            f"POST_BUILD_EXE={args.postbuild}",
+            # f"POST_BUILD_EXE={args.postbuild}",
             "VERBOSE=1",
         ],
         check=True,
     )
 
     # Read the metadata extracted from the source and build trees
-    extracted_gbl_metadata = json.loads(
-        (output_artifact.parent / "gbl_metadata.json").read_text()
-    )
-    base_filename = evaulate_f_string(
-        manifest.get("filename", "{manifest_name}"),
-        {**value_template_env, **extracted_gbl_metadata},
-    )
+    # extracted_gbl_metadata = json.loads(
+    #     (output_artifact.parent / "gbl_metadata.json").read_text()
+    # )
+    # base_filename = evaulate_f_string(
+    #     manifest.get("filename", "{manifest_name}"),
+    #     {**value_template_env, **extracted_gbl_metadata},
+    # )
 
     args.output_dir.mkdir(exist_ok=True)
 
     # Copy the output artifacts
     for extension, output_path in args.outputs:
         if output_path is None:
-            output_path = f"{base_filename}.{extension}"
+            output_path = f"ncp.{extension}"
 
         shutil.copy(
             src=output_artifact.with_suffix(f".{extension}"),
